@@ -9,7 +9,7 @@ Microgrid Energy Optimization Engine powered by FastAPI, Gemini LLM, and Linear 
 4. **LP Optimizer**: Uses PuLP and the COIN-OR CBC solver to model energy balance, battery storage capacity, charge/discharge rates, and dynamic grid pricing over 24 hours.
 
 ## Live API Service
-* **Base URL**: `https://gridwise-solution-x61y.onrender.com`
+* **Base URL**: `https://gridwise-solution-x61y.onrender.com/health`
 
 ## Environment Variables
 Create a `.env` file in the project root:
