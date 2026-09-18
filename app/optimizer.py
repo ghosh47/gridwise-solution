@@ -24,16 +24,13 @@ def solve_grid_optimization(
     prob = pulp.LpProblem("Microgrid_Optimization", pulp.LpMinimize)
     hours = list(range(24))
 
-    # Decision variables
     grid_import = [pulp.LpVariable(f"grid_import_{t}", lowBound=0) for t in hours]
     charge = [pulp.LpVariable(f"charge_{t}", lowBound=0, upBound=max_charge) for t in hours]
     discharge = [pulp.LpVariable(f"discharge_{t}", lowBound=0, upBound=max_discharge) for t in hours]
     soc = [pulp.LpVariable(f"soc_{t}", lowBound=0, upBound=cap) for t in hours]
 
-    # Objective
     prob += pulp.lpSum([grid_prices[t] * grid_import[t] for t in hours])
 
-    # Directives processing
     usable_solar = [float(s) for s in solar]
     min_reserves = [0.0] * 24
     no_charge = [False] * 24
@@ -83,7 +80,6 @@ def solve_grid_optimization(
                 if 0 <= h < 24:
                     max_grid[h] = float(mg) if mg is not None else None
 
-    # Constraints
     prev_soc = init_soc
     for t in hours:
         prob += grid_import[t] + usable_solar[t] + discharge[t] == load[t] + charge[t]
@@ -124,13 +120,27 @@ def solve_grid_optimization(
         if g > peak_grid:
             peak_grid = g
 
+        # Pydantic স্কিমার এক্সপেক্টেড ফিল্ড নাম নির্ধারণ
+        if c > 0.001:
+            action = "charge"
+            b_kwh = c
+        elif d > 0.001:
+            action = "discharge"
+            b_kwh = d
+        else:
+            action = "idle"
+            b_kwh = 0.0
+
         hourly_plan.append({
             "hour": t,
-            "grid_import_kwh": round(g, 2),
+            "grid_kwh": round(g, 2),
+            "solar_kwh": round(usable_solar[t], 2),
             "solar_used_kwh": round(usable_solar[t], 2),
+            "battery_action": action,
+            "battery_kwh": round(b_kwh, 2),
             "battery_charge_kwh": round(c, 2),
             "battery_discharge_kwh": round(d, 2),
-            "battery_soc_kwh": round(s, 2),
+            "battery_energy_after_kwh": round(s, 2),
             "cost_bdt": round(cost, 2)
         })
 
