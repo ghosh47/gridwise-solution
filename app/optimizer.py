@@ -2,18 +2,14 @@ import pulp
 from typing import List, Dict, Any, Tuple
 import shutil
 
-def solve_grid_optimization(hours_data: List[Any], battery: Any, directives: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], float, float, float]:
-    # hours_data থেকে 24 ঘণ্টার ডাটা রিড করা (Pydantic অবজেক্ট বা dict উভয়ের জন্য)
-    def get_val(item, key):
-        if isinstance(item, dict):
-            return item.get(key, 0.0)
-        return getattr(item, key, 0.0)
+def solve_grid_optimization(
+    load: List[float],
+    solar: List[float],
+    grid_prices: List[float],
+    battery: Any,
+    directives: List[Dict[str, Any]]
+) -> Tuple[List[Dict[str, Any]], float, float, float]:
 
-    load = [float(get_val(h, "load_kwh")) for h in hours_data]
-    solar = [float(get_val(h, "solar_kwh")) for h in hours_data]
-    grid_prices = [float(get_val(h, "grid_price_bdt_per_kwh")) for h in hours_data]
-
-    # Battery প্রোপার্টি রিড করা
     def get_bat(obj, key, default=0.0):
         if isinstance(obj, dict):
             return obj.get(key, default)
@@ -38,24 +34,36 @@ def solve_grid_optimization(hours_data: List[Any], battery: Any, directives: Lis
     prob += pulp.lpSum([grid_prices[t] * grid_import[t] for t in hours])
 
     # Directives processing
-    usable_solar = list(solar)
+    usable_solar = [float(s) for s in solar]
     min_reserves = [0.0] * 24
     no_charge = [False] * 24
     no_discharge = [False] * 24
     max_grid = [None] * 24
 
     for d in directives:
-        if not d.get("applies"):
+        if isinstance(d, dict):
+            applies = d.get("applies")
+            dtype = d.get("directive_type")
+            adj = d.get("structured_adjustment") or {}
+        else:
+            applies = getattr(d, "applies", False)
+            dtype = getattr(d, "directive_type", "no_op")
+            adj = getattr(d, "structured_adjustment", {}) or {}
+            if hasattr(adj, "dict"):
+                adj = adj.dict()
+            elif hasattr(adj, "model_dump"):
+                adj = adj.model_dump()
+
+        if not applies:
             continue
-        dtype = d.get("directive_type")
-        adj = d.get("structured_adjustment") or {}
+
         target_hours = adj.get("hours", [])
 
         if dtype == "solar_reduction":
             factor = float(adj.get("factor", 1.0))
             for h in target_hours:
                 if 0 <= h < 24:
-                    usable_solar[h] = solar[h] * factor
+                    usable_solar[h] = float(solar[h]) * factor
         elif dtype == "minimum_battery_reserve":
             min_kwh = float(adj.get("minimum_energy_kwh", 0.0))
             for h in target_hours:
@@ -130,5 +138,4 @@ def solve_grid_optimization(hours_data: List[Any], battery: Any, directives: Lis
     total_cost = round(total_cost, 2)
     peak_grid = round(peak_grid, 2)
 
-    # main.py-এর প্রত্যাশিত ফরম্যাট অনুযায়ী 4টি ভ্যালু আনপ্যাক করার জন্য রিটার্ন
     return hourly_plan, total_grid_kwh, total_cost, peak_grid
