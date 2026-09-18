@@ -30,32 +30,31 @@ Operator Notes:
 {notes}
 """
 
-CANDIDATE_MODELS = ["gemini-3.6-flash", "gemini-2.5-flash"]
+MODEL_NAME = "gemini-3.6-flash"
 
 def extract_directives(notes: List[str], battery: BatteryInput) -> List[dict]:
     notes_text = "\n".join([f"Note {idx}: {text}" for idx, text in enumerate(notes)])
     full_prompt = PROMPT.format(capacity=battery.capacity_kwh, notes=notes_text)
 
     last_err = None
-    for model_name in CANDIDATE_MODELS:
-        for attempt in range(4):
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=full_prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=list[DirectiveInterpretation],
-                        temperature=0.0
-                    )
+    for attempt in range(4):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=full_prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=list[DirectiveInterpretation],
+                    temperature=0.0
                 )
-                return json.loads(response.text)
-            except Exception as e:
-                last_err = e
-                err_str = str(e).lower()
-                if "503" in err_str or "unavailable" in err_str or "429" in err_str:
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                break
+            )
+            return json.loads(response.text)
+        except Exception as e:
+            last_err = e
+            err_str = str(e).lower()
+            if "503" in err_str or "unavailable" in err_str or "429" in err_str:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise e
 
     raise last_err
