@@ -19,11 +19,26 @@ def optimize_energy(req: OptimizeRequest):
         raw_directives = extract_directives(req.operator_notes, req.battery)
         directives = validate_and_sanitize_directives(raw_directives)
         
-        # Pydantic অবজেক্ট থেকে সরাসরি লিস্ট ও ডিকশনারি তৈরি
-        load = [float(h.load_kwh) for h in req.hours]
-        solar = [float(h.solar_kwh) for h in req.hours]
-        grid_prices = [float(h.grid_price_bdt_per_kwh) for h in req.hours]
-        dict_directives = [d.dict() if hasattr(d, "dict") else (d.model_dump() if hasattr(d, "model_dump") else d) for d in directives]
+        def extract_val(item, keys):
+            if isinstance(item, dict):
+                for k in keys:
+                    if k in item and item[k] is not None:
+                        return float(item[k])
+            else:
+                for k in keys:
+                    if hasattr(item, k) and getattr(item, k) is not None:
+                        return float(getattr(item, k))
+            return 0.0
+
+        # বিভিন্ন সম্ভাব্য ফিল্ড নামের অটো-ম্যাপিং
+        load = [extract_val(h, ["load", "load_kwh", "load_kw", "demand_kwh"]) for h in req.hours]
+        solar = [extract_val(h, ["solar", "solar_kwh", "solar_kw", "solar_generation_kw", "pv_kwh"]) for h in req.hours]
+        grid_prices = [extract_val(h, ["grid_price_bdt_per_kwh", "grid_price", "price", "tariff"]) for h in req.hours]
+        
+        dict_directives = [
+            d.dict() if hasattr(d, "dict") else (d.model_dump() if hasattr(d, "model_dump") else d)
+            for d in directives
+        ]
 
         plan, total_grid, total_cost, peak_grid = solve_grid_optimization(
             load=load,
