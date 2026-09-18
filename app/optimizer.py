@@ -1,49 +1,29 @@
 import pulp
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 import shutil
 
-def solve_grid_optimization(*args, **kwargs) -> Dict[str, Any]:
-    # রিকোয়েস্ট অবজেক্ট বা আলাদা প্যারামিটার আনপ্যাক করা
-    load = []
-    solar = []
-    grid_prices = []
-    battery = None
-    directives = []
+def solve_grid_optimization(hours_data: List[Any], battery: Any, directives: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], float, float, float]:
+    # hours_data থেকে 24 ঘণ্টার ডাটা রিড করা (Pydantic অবজেক্ট বা dict উভয়ের জন্য)
+    def get_val(item, key):
+        if isinstance(item, dict):
+            return item.get(key, 0.0)
+        return getattr(item, key, 0.0)
 
-    # কেস ১: যদি প্রথম আর্গুমেন্টেই সম্পূর্ণ রিকোয়েস্ট মডেল বা ডিকশনারি পাস হয়
-    if len(args) == 1 and hasattr(args[0], 'battery'):
-        req = args[0]
-        load = getattr(req, 'load_profile_kw', [])
-        solar = getattr(req, 'solar_generation_kw', [])
-        grid_prices = getattr(req, 'grid_prices', [])
-        battery = getattr(req, 'battery', None)
-        directives = kwargs.get('directives', [])
-    elif len(args) == 1 and isinstance(args[0], dict) and 'battery' in args[0]:
-        req = args[0]
-        load = req.get('load_profile_kw', [])
-        solar = req.get('solar_generation_kw', [])
-        grid_prices = req.get('grid_prices', [])
-        battery = req.get('battery')
-        directives = kwargs.get('directives', [])
-    else:
-        # কেস ২: আলাদা আলাদা আর্গুমেন্ট হিসেবে আসলে
-        load = kwargs.get("load", kwargs.get("load_profile_kw")) or (args[0] if len(args) > 0 else [])
-        solar = kwargs.get("solar", kwargs.get("solar_generation_kw")) or (args[1] if len(args) > 1 else [])
-        grid_prices = kwargs.get("grid_prices") or (args[2] if len(args) > 2 else [])
-        battery = kwargs.get("battery") or (args[3] if len(args) > 3 else None)
-        directives = kwargs.get("directives") or (args[4] if len(args) > 4 else [])
+    load = [float(get_val(h, "load_kwh")) for h in hours_data]
+    solar = [float(get_val(h, "solar_kwh")) for h in hours_data]
+    grid_prices = [float(get_val(h, "grid_price_bdt_per_kwh")) for h in hours_data]
 
-    # Battery প্রোপার্টি নিরাপদে রিড করা (Pydantic অবজেক্ট অথবা ডিকশনারি উভয় সাপোর্ট)
-    def get_attr(obj, key, default=0.0):
+    # Battery প্রোপার্টি রিড করা
+    def get_bat(obj, key, default=0.0):
         if isinstance(obj, dict):
             return obj.get(key, default)
         return getattr(obj, key, default)
 
-    cap = float(get_attr(battery, "capacity_kwh", 20.0))
-    init_soc = float(get_attr(battery, "initial_soc_kwh", 10.0))
-    max_charge = float(get_attr(battery, "max_charge_rate_kw", 5.0))
-    max_discharge = float(get_attr(battery, "max_discharge_rate_kw", 5.0))
-    eff = float(get_attr(battery, "efficiency", 0.95))
+    cap = float(get_bat(battery, "capacity_kwh", 20.0))
+    init_soc = float(get_bat(battery, "initial_soc_kwh", 10.0))
+    max_charge = float(get_bat(battery, "max_charge_rate_kw", 5.0))
+    max_discharge = float(get_bat(battery, "max_discharge_rate_kw", 5.0))
+    eff = float(get_bat(battery, "efficiency", 0.95))
 
     prob = pulp.LpProblem("Microgrid_Optimization", pulp.LpMinimize)
     hours = list(range(24))
@@ -57,7 +37,8 @@ def solve_grid_optimization(*args, **kwargs) -> Dict[str, Any]:
     # Objective
     prob += pulp.lpSum([grid_prices[t] * grid_import[t] for t in hours])
 
-    usable_solar = [float(s) for s in solar]
+    # Directives processing
+    usable_solar = list(solar)
     min_reserves = [0.0] * 24
     no_charge = [False] * 24
     no_discharge = [False] * 24
@@ -74,7 +55,7 @@ def solve_grid_optimization(*args, **kwargs) -> Dict[str, Any]:
             factor = float(adj.get("factor", 1.0))
             for h in target_hours:
                 if 0 <= h < 24:
-                    usable_solar[h] = float(solar[h]) * factor
+                    usable_solar[h] = solar[h] * factor
         elif dtype == "minimum_battery_reserve":
             min_kwh = float(adj.get("minimum_energy_kwh", 0.0))
             for h in target_hours:
@@ -129,8 +110,9 @@ def solve_grid_optimization(*args, **kwargs) -> Dict[str, Any]:
         d = float(pulp.value(discharge[t]) or 0.0)
         s = float(pulp.value(soc[t]) or 0.0)
 
+        cost = g * grid_prices[t]
         total_grid_kwh += g
-        total_cost += g * float(grid_prices[t])
+        total_cost += cost
         if g > peak_grid:
             peak_grid = g
 
@@ -141,14 +123,12 @@ def solve_grid_optimization(*args, **kwargs) -> Dict[str, Any]:
             "battery_charge_kwh": round(c, 2),
             "battery_discharge_kwh": round(d, 2),
             "battery_soc_kwh": round(s, 2),
-            "cost_bdt": round(g * float(grid_prices[t]), 2)
+            "cost_bdt": round(cost, 2)
         })
 
-    return {
-        "hourly_plan": hourly_plan,
-        "metrics": {
-            "total_grid_kwh": round(total_grid_kwh, 2),
-            "total_cost_bdt": round(total_cost, 2),
-            "peak_grid_kwh": round(peak_grid, 2)
-        }
-    }
+    total_grid_kwh = round(total_grid_kwh, 2)
+    total_cost = round(total_cost, 2)
+    peak_grid = round(peak_grid, 2)
+
+    # main.py-এর প্রত্যাশিত ফরম্যাট অনুযায়ী 4টি ভ্যালু আনপ্যাক করার জন্য রিটার্ন
+    return hourly_plan, total_grid_kwh, total_cost, peak_grid
