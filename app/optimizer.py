@@ -2,7 +2,7 @@ import pulp
 from typing import List, Dict, Any
 import shutil
 
-def solve_microgrid(
+def solve_grid_optimization(
     load: List[float],
     solar: List[float],
     grid_prices: List[float],
