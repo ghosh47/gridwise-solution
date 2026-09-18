@@ -1,125 +1,60 @@
-import pulp
-from typing import List, Dict, Any
-import shutil
+import os
+import json
+import time
+from typing import List
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from app.schemas import DirectiveInterpretation, BatteryInput
 
-def solve_grid_optimization(
-    load: List[float],
-    solar: List[float],
-    grid_prices: List[float],
-    battery: Any,
-    directives: List[Dict[str, Any]]
-) -> Dict[str, Any]:
-    prob = pulp.LpProblem("Microgrid_Optimization", pulp.LpMinimize)
-    hours = list(range(24))
+load_dotenv()
 
-    # Decision variables
-    grid_import = [pulp.LpVariable(f"grid_import_{t}", lowBound=0) for t in hours]
-    charge = [pulp.LpVariable(f"charge_{t}", lowBound=0, upBound=battery.max_charge_rate_kw) for t in hours]
-    discharge = [pulp.LpVariable(f"discharge_{t}", lowBound=0, upBound=battery.max_discharge_rate_kw) for t in hours]
-    soc = [pulp.LpVariable(f"soc_{t}", lowBound=0, upBound=battery.capacity_kwh) for t in hours]
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-    # Objective
-    prob += pulp.lpSum([grid_prices[t] * grid_import[t] for t in hours])
+PROMPT = """You are an expert energy grid directive interpreter.
+Convert natural-language operator notes into structured directives for a 24-hour microgrid.
 
-    # Dynamic directive modifications
-    usable_solar = list(solar)
-    min_reserves = [0.0] * 24
-    no_charge = [False] * 24
-    no_discharge = [False] * 24
-    max_grid = [None] * 24
+Context:
+Battery capacity: {capacity} kWh.
 
-    for d in directives:
-        if not d.get("applies"):
-            continue
-        dtype = d.get("directive_type")
-        adj = d.get("structured_adjustment") or {}
-        target_hours = adj.get("hours", [])
+Strict Operational Rules:
+1. Supported directive_type: "solar_reduction", "minimum_battery_reserve", "no_charge_window", "no_discharge_window", "max_grid_window", "no_op".
+2. Irrelevant notes: applies = false, directive_type = "no_op", structured_adjustment = null.
+3. Applicable directives: applies = true.
+4. Time windows are start-inclusive, end-exclusive (e.g., 1 PM to 3 PM -> [13, 14], noon to 2 PM -> [12, 13], 6 PM to 9 PM -> [18, 19, 20]). Hours must be unique integers 0..23 in ascending order.
+5. solar_reduction: factor is the REMAINING usable fraction between 0.0 and 1.0 (e.g., 80% reduction -> factor = 0.2; usable solar 25% -> factor = 0.25).
+6. minimum_battery_reserve: if given as percentage (e.g. 50%), convert to kWh using capacity ({capacity} * percentage / 100).
+7. Return exactly one interpretation per operator note in note_index order (0 to N-1).
 
-        if dtype == "solar_reduction":
-            factor = adj.get("factor", 1.0)
-            for h in target_hours:
-                if 0 <= h < 24:
-                    usable_solar[h] = solar[h] * factor
-        elif dtype == "minimum_battery_reserve":
-            min_kwh = adj.get("minimum_energy_kwh", 0.0)
-            for h in target_hours:
-                if 0 <= h < 24:
-                    min_reserves[h] = max(min_reserves[h], min_kwh)
-        elif dtype == "no_charge_window":
-            for h in target_hours:
-                if 0 <= h < 24:
-                    no_charge[h] = True
-        elif dtype == "no_discharge_window":
-            for h in target_hours:
-                if 0 <= h < 24:
-                    no_discharge[h] = True
-        elif dtype == "max_grid_window":
-            mg = adj.get("max_grid_kwh")
-            for h in target_hours:
-                if 0 <= h < 24:
-                    max_grid[h] = mg
+Operator Notes:
+{notes}
+"""
 
-    # Constraints
-    prev_soc = battery.initial_soc_kwh
-    for t in hours:
-        # Balance equation
-        prob += grid_import[t] + usable_solar[t] + discharge[t] == load[t] + charge[t]
+MODEL_NAME = "gemini-3.6-flash"
 
-        # Battery dynamics (hourly: energy = power * 1h)
-        prob += soc[t] == prev_soc + (charge[t] * battery.efficiency) - (discharge[t] / battery.efficiency)
-        prev_soc = soc[t]
+def extract_directives(notes: List[str], battery: BatteryInput) -> List[dict]:
+    notes_text = "\n".join([f"Note {idx}: {text}" for idx, text in enumerate(notes)])
+    full_prompt = PROMPT.format(capacity=battery.capacity_kwh, notes=notes_text)
 
-        # Directives constraints
-        if min_reserves[t] > 0:
-            prob += soc[t] >= min_reserves[t]
-        if no_charge[t]:
-            prob += charge[t] == 0
-        if no_discharge[t]:
-            prob += discharge[t] == 0
-        if max_grid[t] is not None:
-            prob += grid_import[t] <= max_grid[t]
+    last_err = None
+    for attempt in range(4):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=full_prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=list[DirectiveInterpretation],
+                    temperature=0.0
+                )
+            )
+            return json.loads(response.text)
+        except Exception as e:
+            last_err = e
+            err_str = str(e).lower()
+            if "503" in err_str or "unavailable" in err_str or "429" in err_str:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise e
 
-    # Solver fallback: লিনাক্স কন্টেইনারের জন্য CBC পাথ নিশ্চিত করা
-    cbc_path = shutil.which("cbc")
-    if cbc_path:
-        solver = pulp.COIN_CMD(path=cbc_path, msg=False)
-    else:
-        solver = pulp.PULP_CBC_CMD(msg=False)
-
-    prob.solve(solver)
-
-    # Prepare outputs
-    hourly_plan = []
-    total_grid_kwh = 0.0
-    total_cost = 0.0
-    peak_grid = 0.0
-
-    for t in hours:
-        g = float(pulp.value(grid_import[t]) or 0.0)
-        c = float(pulp.value(charge[t]) or 0.0)
-        d = float(pulp.value(discharge[t]) or 0.0)
-        s = float(pulp.value(soc[t]) or 0.0)
-
-        total_grid_kwh += g
-        total_cost += g * grid_prices[t]
-        if g > peak_grid:
-            peak_grid = g
-
-        hourly_plan.append({
-            "hour": t,
-            "grid_import_kwh": round(g, 2),
-            "solar_used_kwh": round(usable_solar[t], 2),
-            "battery_charge_kwh": round(c, 2),
-            "battery_discharge_kwh": round(d, 2),
-            "battery_soc_kwh": round(s, 2),
-            "cost_bdt": round(g * grid_prices[t], 2)
-        })
-
-    return {
-        "hourly_plan": hourly_plan,
-        "metrics": {
-            "total_grid_kwh": round(total_grid_kwh, 2),
-            "total_cost_bdt": round(total_cost, 2),
-            "peak_grid_kwh": round(peak_grid, 2)
-        }
-    }
+    raise last_err
