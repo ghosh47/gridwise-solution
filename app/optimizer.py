@@ -1,101 +1,125 @@
 import pulp
-from typing import List, Tuple
-from app.schemas import HourInput, BatteryInput, DirectiveInterpretation, HourlyPlanItem
+from typing import List, Dict, Any
+import shutil
 
-def solve_grid_optimization(
-    hours: List[HourInput],
-    battery: BatteryInput,
-    directives: List[DirectiveInterpretation]
-) -> Tuple[List[HourlyPlanItem], float, float, float]:
-    
-    # সোলার অ্যাডজাস্টমেন্ট
-    solar_avail = [h.solar_kwh for h in hours]
+def solve_microgrid(
+    load: List[float],
+    solar: List[float],
+    grid_prices: List[float],
+    battery: Any,
+    directives: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    prob = pulp.LpProblem("Microgrid_Optimization", pulp.LpMinimize)
+    hours = list(range(24))
+
+    # Decision variables
+    grid_import = [pulp.LpVariable(f"grid_import_{t}", lowBound=0) for t in hours]
+    charge = [pulp.LpVariable(f"charge_{t}", lowBound=0, upBound=battery.max_charge_rate_kw) for t in hours]
+    discharge = [pulp.LpVariable(f"discharge_{t}", lowBound=0, upBound=battery.max_discharge_rate_kw) for t in hours]
+    soc = [pulp.LpVariable(f"soc_{t}", lowBound=0, upBound=battery.capacity_kwh) for t in hours]
+
+    # Objective
+    prob += pulp.lpSum([grid_prices[t] * grid_import[t] for t in hours])
+
+    # Dynamic directive modifications
+    usable_solar = list(solar)
+    min_reserves = [0.0] * 24
+    no_charge = [False] * 24
+    no_discharge = [False] * 24
+    max_grid = [None] * 24
+
     for d in directives:
-        if d.applies and d.directive_type == "solar_reduction" and d.structured_adjustment:
-            factor = d.structured_adjustment.factor if d.structured_adjustment.factor is not None else 1.0
-            for hr in (d.structured_adjustment.hours or []):
-                solar_avail[hr] = solar_avail[hr] * factor
-
-    # কনস্ট্রেইন্ট উইন্ডো ফিল্টার
-    no_charge_hrs = set()
-    no_discharge_hrs = set()
-    min_reserve = {t: battery.minimum_energy_kwh for t in range(24)}
-    max_grid = {t: None for t in range(24)}
-
-    for d in directives:
-        if not d.applies or not d.structured_adjustment:
+        if not d.get("applies"):
             continue
-        hrs = d.structured_adjustment.hours or []
-        if d.directive_type == "no_charge_window":
-            no_charge_hrs.update(hrs)
-        elif d.directive_type == "no_discharge_window":
-            no_discharge_hrs.update(hrs)
-        elif d.directive_type == "minimum_battery_reserve":
-            for hr in hrs:
-                min_reserve[hr] = max(min_reserve[hr], d.structured_adjustment.minimum_energy_kwh)
-        elif d.directive_type == "max_grid_window":
-            for hr in hrs:
-                max_grid[hr] = d.structured_adjustment.max_grid_kwh
+        dtype = d.get("directive_type")
+        adj = d.get("structured_adjustment") or {}
+        target_hours = adj.get("hours", [])
 
-    # LP সমস্যা গঠন
-    prob = pulp.LpProblem("GridWise_LP", pulp.LpMinimize)
+        if dtype == "solar_reduction":
+            factor = adj.get("factor", 1.0)
+            for h in target_hours:
+                if 0 <= h < 24:
+                    usable_solar[h] = solar[h] * factor
+        elif dtype == "minimum_battery_reserve":
+            min_kwh = adj.get("minimum_energy_kwh", 0.0)
+            for h in target_hours:
+                if 0 <= h < 24:
+                    min_reserves[h] = max(min_reserves[h], min_kwh)
+        elif dtype == "no_charge_window":
+            for h in target_hours:
+                if 0 <= h < 24:
+                    no_charge[h] = True
+        elif dtype == "no_discharge_window":
+            for h in target_hours:
+                if 0 <= h < 24:
+                    no_discharge[h] = True
+        elif dtype == "max_grid_window":
+            mg = adj.get("max_grid_kwh")
+            for h in target_hours:
+                if 0 <= h < 24:
+                    max_grid[h] = mg
 
-    grid = [pulp.LpVariable(f"grid_{t}", lowBound=0) for t in range(24)]
-    solar_used = [pulp.LpVariable(f"solar_used_{t}", lowBound=0, upBound=solar_avail[t]) for t in range(24)]
-    charge = [pulp.LpVariable(f"charge_{t}", lowBound=0, upBound=battery.max_charge_kwh_per_hour) for t in range(24)]
-    discharge = [pulp.LpVariable(f"discharge_{t}", lowBound=0, upBound=battery.max_discharge_kwh_per_hour) for t in range(24)]
-    soc = [pulp.LpVariable(f"soc_{t}", lowBound=0, upBound=battery.capacity_kwh) for t in range(24)]
+    # Constraints
+    prev_soc = battery.initial_soc_kwh
+    for t in hours:
+        # Balance equation
+        prob += grid_import[t] + usable_solar[t] + discharge[t] == load[t] + charge[t]
 
-    # খরচ মিনিমাইজ করার অবজেক্টিভ
-    prob += pulp.lpSum([grid[t] * hours[t].tariff_bdt_per_kwh for t in range(24)])
-
-    prev_soc = battery.initial_energy_kwh
-    for t in range(24):
-        # এনার্জি ব্যালান্স
-        prob += grid[t] + solar_used[t] + discharge[t] == hours[t].demand_kwh + charge[t]
-        # ব্যাটারি সঞ্চয় হিসাব
-        prob += soc[t] == prev_soc + charge[t] - discharge[t]
+        # Battery dynamics (hourly: energy = power * 1h)
+        prob += soc[t] == prev_soc + (charge[t] * battery.efficiency) - (discharge[t] / battery.efficiency)
         prev_soc = soc[t]
-        prob += soc[t] >= min_reserve[t]
 
-        if t in no_charge_hrs:
+        # Directives constraints
+        if min_reserves[t] > 0:
+            prob += soc[t] >= min_reserves[t]
+        if no_charge[t]:
             prob += charge[t] == 0
-        if t in no_discharge_hrs:
+        if no_discharge[t]:
             prob += discharge[t] == 0
         if max_grid[t] is not None:
-            prob += grid[t] <= max_grid[t]
+            prob += grid_import[t] <= max_grid[t]
 
-    # দিন শেষে ব্যাটারি নিউট্রালিটি
-    prob += soc[23] == battery.initial_energy_kwh
+    # Solver fallback: লিনাক্স কন্টেইনারের জন্য CBC পাথ নিশ্চিত করা
+    cbc_path = shutil.which("cbc")
+    if cbc_path:
+        solver = pulp.COIN_CMD(path=cbc_path, msg=False)
+    else:
+        solver = pulp.PULP_CBC_CMD(msg=False)
 
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    prob.solve(solver)
 
+    # Prepare outputs
     hourly_plan = []
-    for t in range(24):
-        c_val = float(charge[t].varValue or 0.0)
-        d_val = float(discharge[t].varValue or 0.0)
+    total_grid_kwh = 0.0
+    total_cost = 0.0
+    peak_grid = 0.0
 
-        if c_val > 0.001:
-            action = "charge"
-            b_kwh = c_val
-        elif d_val > 0.001:
-            action = "discharge"
-            b_kwh = d_val
-        else:
-            action = "idle"
-            b_kwh = 0.0
+    for t in hours:
+        g = float(pulp.value(grid_import[t]) or 0.0)
+        c = float(pulp.value(charge[t]) or 0.0)
+        d = float(pulp.value(discharge[t]) or 0.0)
+        s = float(pulp.value(soc[t]) or 0.0)
 
-        hourly_plan.append(HourlyPlanItem(
-            hour=t,
-            grid_kwh=round(float(grid[t].varValue or 0.0), 2),
-            solar_used_kwh=round(float(solar_used[t].varValue or 0.0), 2),
-            battery_action=action,
-            battery_kwh=round(b_kwh, 2),
-            battery_energy_after_kwh=round(float(soc[t].varValue or 0.0), 2)
-        ))
+        total_grid_kwh += g
+        total_cost += g * grid_prices[t]
+        if g > peak_grid:
+            peak_grid = g
 
-    total_grid_kwh = round(sum(p.grid_kwh for p in hourly_plan), 2)
-    total_cost_bdt = round(sum(p.grid_kwh * hours[t].tariff_bdt_per_kwh for t, p in enumerate(hourly_plan)), 2)
-    peak_grid_kwh = round(max(p.grid_kwh for p in hourly_plan), 2)
+        hourly_plan.append({
+            "hour": t,
+            "grid_import_kwh": round(g, 2),
+            "solar_used_kwh": round(usable_solar[t], 2),
+            "battery_charge_kwh": round(c, 2),
+            "battery_discharge_kwh": round(d, 2),
+            "battery_soc_kwh": round(s, 2),
+            "cost_bdt": round(g * grid_prices[t], 2)
+        })
 
-    return hourly_plan, total_grid_kwh, total_cost_bdt, peak_grid_kwh
+    return {
+        "hourly_plan": hourly_plan,
+        "metrics": {
+            "total_grid_kwh": round(total_grid_kwh, 2),
+            "total_cost_bdt": round(total_cost, 2),
+            "peak_grid_kwh": round(peak_grid, 2)
+        }
+    }
