@@ -30,7 +30,7 @@ Operator Notes:
 {notes}
 """
 
-CANDIDATE_MODELS = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+CANDIDATE_MODELS = ["gemini-3.6-flash", "gemini-2.5-flash"]
 
 def extract_directives(notes: List[str], battery: BatteryInput) -> List[dict]:
     notes_text = "\n".join([f"Note {idx}: {text}" for idx, text in enumerate(notes)])
@@ -38,7 +38,7 @@ def extract_directives(notes: List[str], battery: BatteryInput) -> List[dict]:
 
     last_err = None
     for model_name in CANDIDATE_MODELS:
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 response = client.models.generate_content(
                     model=model_name,
@@ -53,11 +53,9 @@ def extract_directives(notes: List[str], battery: BatteryInput) -> List[dict]:
             except Exception as e:
                 last_err = e
                 err_str = str(e).lower()
-                # 503 বা 429 রেট লিমিট পেলে বিরতি দিয়ে পুনরায় চেষ্টা করবে
                 if "503" in err_str or "unavailable" in err_str or "429" in err_str:
                     time.sleep(2 * (attempt + 1))
                     continue
-                # মডেল নট ফাউন্ড হলে পরের মডেলে সুইচ করবে
                 break
 
     raise last_err
